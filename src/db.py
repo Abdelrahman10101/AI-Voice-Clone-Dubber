@@ -8,6 +8,16 @@ def get_connection() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     return conn
 
+# Alias for backward compatibility
+get_db = get_connection
+
+def get_latest_job_for_file(input_file: str) -> Optional[Dict[str, Any]]:
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM jobs WHERE input_file = ? ORDER BY created_at DESC LIMIT 1", (input_file,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
 def init_db():
     """Initialize database tables for jobs and chunk tracking."""
     with get_connection() as conn:

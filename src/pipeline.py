@@ -4,63 +4,95 @@ import time
 import argparse
 import logging
 from pathlib import Path
+from typing import Optional
 
-# Ensure project root is in sys.path
+from rich.console import Console
+from rich.panel import Panel
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeRemainingColumn
+from rich.table import Table
+
+# Add project root to sys.path
 BASE_DIR = Path(__file__).resolve().parent.parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from datetime import datetime
-from rich.console import Console
-from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeRemainingColumn
-from rich.table import Table
+from src.config import config, DATA_DIR, OUTPUT_DIR
+from src import audio_utils, db, stt, translator, tts_cloner
 
-from src.config import config, OUTPUT_DIR
-from src import db
-from src import audio_utils
-from src import stt
-from src import translator
-from src import tts_cloner
+# Force UTF-8 on Windows consoles to prevent cp1252 charmap encoding errors
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+if hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
-console = Console()
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+console = Console(safe_box=True)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logger = logging.getLogger("sts_pipeline")
 
-def generate_job_id(input_path: str) -> str:
-    stem = Path(input_path).stem.replace(" ", "_")
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return f"{stem}_{timestamp}"
+
+def generate_job_id(input_file_path: str) -> str:
+    """Generates a reproducible, clean job identifier based on input file name and timestamp."""
+    stem = Path(input_file_path).stem
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    clean_stem = "".join(c if c.isalnum() else "_" for c in stem)
+    return f"{clean_stem}_{timestamp}"
+
 
 def run_pipeline(
     input_file: str,
-    job_id: str = None,
-    output_dir: str = None,
+    job_id: Optional[str] = None,
+    output_dir: Optional[str] = None,
     stt_backend: str = config.stt_backend,
+    translation_engine: str = config.translation_engine,
     model_llm: str = config.translation_model,
+    gemini_api_key: Optional[str] = None,
+    stt_batch_size: int = config.stt_batch_size,
+    translation_batch_size: int = config.translation_batch_size,
     resume: bool = False
 ):
+    """Executes the complete Arabic-to-English Speech-to-Speech dubbing pipeline."""
     start_time = time.time()
     input_path = Path(input_file).resolve()
+    
     if not input_path.exists():
-        console.print(f"[bold red]Error:[/] Input file '{input_file}' does not exist.")
+        console.print(f"[bold red]Error:[/] Input media file not found: {input_path}")
         sys.exit(1)
 
-    # Initialize SQLite database
+    effective_api_key = gemini_api_key or config.gemini_api_key or os.getenv("GEMINI_API_KEY", "")
+
+    # Preflight check for Gemini API key
+    if (stt_backend == "gemini" or translation_engine == "gemini_api") and not effective_api_key:
+        console.print(Panel(
+            "[bold red]Missing Google Gemini API Key![/]\n\n"
+            "You selected Gemini Transcriber or Gemma 4 31B via Gemini API, but no API key was found.\n"
+            "Please provide your API key by:\n"
+            "  1. Creating a [bold green].env[/] file in the project root: [bold yellow]GEMINI_API_KEY=your_key_here[/]\n"
+            "  2. Setting an environment variable: [bold yellow]$env:GEMINI_API_KEY='your_key_here'[/]\n"
+            "  3. Passing the CLI parameter: [bold yellow]--gemini-api-key your_key_here[/]\n\n"
+            "[dim]Get a free API key at: https://aistudio.google.com/app/apikey[/]",
+            title="Configuration Required",
+            border_style="red"
+        ))
+        sys.exit(1)
+
+    # Initialize SQLite Database
     db.init_db()
 
-    # Determine Job ID and Output Directory
+    # Determine job ID
     if not job_id:
         if resume:
-            # Look for existing job matching this input file
-            with db.get_connection() as conn:
-                cur = conn.cursor()
-                cur.execute("SELECT id FROM jobs WHERE input_file = ? ORDER BY created_at DESC LIMIT 1", (str(input_path),))
-                row = cur.fetchone()
-                if row:
-                    job_id = row["id"]
-                    console.print(f"[bold green]Found existing job for resume:[/] {job_id}")
-                else:
-                    job_id = generate_job_id(str(input_path))
+            latest_job = db.get_latest_job_for_file(str(input_path))
+            if latest_job:
+                job_id = latest_job["id"]
+                console.print(f"[bold green]Found existing job for resume:[/] {job_id}")
+            else:
+                job_id = generate_job_id(str(input_path))
         else:
             job_id = generate_job_id(str(input_path))
 
@@ -69,16 +101,19 @@ def run_pipeline(
     job_output_dir.mkdir(parents=True, exist_ok=True)
     chunks_dir.mkdir(parents=True, exist_ok=True)
 
+    stt_label = f"Gemini Transcriber ({config.gemini_stt_model})" if stt_backend == "gemini" else stt_backend.upper()
+    trans_label = f"Gemini API ({model_llm})" if translation_engine == "gemini_api" else f"Ollama ({model_llm})"
+
     # Header Panel
     console.print(Panel(
-        f"[bold cyan]Arabic-to-English Speech Dubbing & Voice Cloning Pipeline[/]\n"
+        f"[bold cyan]Arabic-to-English Speech Dubbing & Voice Cloning Studio[/]\n"
         f"[dim]Input:[/] {input_path.name}\n"
         f"[dim]Job ID:[/] {job_id}\n"
-        f"[dim]STT Engine:[/] {stt_backend.upper()} (4-bit GGUF)\n"
-        f"[dim]Translation:[/] Ollama ({model_llm})\n"
+        f"[dim]STT Engine:[/] {stt_label}\n"
+        f"[dim]Translation:[/] {trans_label}\n"
         f"[dim]Voice Cloner:[/] OpenVoice v2 (< 1.0 GB VRAM)\n"
         f"[dim]Output Folder:[/] {job_output_dir}",
-        title="🎙️ Antigravity STS Studio",
+        title="STS Studio",
         border_style="cyan"
     ))
 
@@ -88,7 +123,7 @@ def run_pipeline(
         input_file=str(input_path),
         output_dir=str(job_output_dir),
         model_stt=stt_backend,
-        model_llm=model_llm,
+        model_llm=f"{translation_engine}:{model_llm}",
         model_tts="openvoice_v2"
     )
 
@@ -108,7 +143,7 @@ def run_pipeline(
 
     if not speaker_ref_wav.exists():
         audio_utils.extract_speaker_reference(str(extracted_wav), str(speaker_ref_wav), target_duration=8.0)
-        console.print(f"✓ Isolated 8-second speaker vocal reference.")
+        console.print("✓ Isolated 8-second speaker vocal reference.")
 
     # Retrieve existing chunks or perform fresh VAD segmentation
     chunks = db.get_chunks(job_id)
@@ -127,9 +162,9 @@ def run_pipeline(
     console.print(f"✓ Total speech chunks: [bold green]{len(chunks)}[/]")
 
     # =========================================================================
-    # Step 1: Speech-to-Text (Audar-ASR / faster-whisper)
+    # Step 1: Speech-to-Text (Gemini Transcriber / whisper / audar)
     # =========================================================================
-    console.print(f"\n[bold yellow]Step 1: Transcribing Arabic Speech ({stt_backend.upper()})...[/]")
+    console.print(f"\n[bold yellow]Step 1: Transcribing Arabic Speech ({stt_label})...[/]")
     db.update_job_status(job_id, "transcribing")
     
     with Progress(
@@ -146,7 +181,14 @@ def run_pipeline(
             snippet = (text[:35] + "...") if len(text) > 35 else text
             progress.update(task_stt, completed=idx + 1, description=f"Chunk {idx+1}/{total}: {snippet}")
 
-        chunks = stt.process_stt_stage(chunks, job_id, backend=stt_backend, progress_callback=stt_callback)
+        chunks = stt.process_stt_stage(
+            chunks, 
+            job_id, 
+            backend=stt_backend, 
+            api_key=effective_api_key, 
+            batch_size=stt_batch_size,
+            progress_callback=stt_callback
+        )
 
     # Export Arabic transcripts and subtitles
     ar_txt_path = job_output_dir / "transcript_ar.txt"
@@ -157,15 +199,15 @@ def run_pipeline(
     console.print(f"✓ Arabic subtitles saved: [cyan]{ar_srt_path.name}[/]")
 
     # =========================================================================
-    # Step 2: Translation (Ollama: Ministral-3B / Qwen-2.5)
+    # Step 2: Translation (Gemma 4 31B via Gemini API / Ollama)
     # =========================================================================
-    console.print(f"\n[bold yellow]Step 2: Translating to English via Ollama ({model_llm})...[/]")
+    console.print(f"\n[bold yellow]Step 2: Translating to English ({trans_label})...[/]")
     db.update_job_status(job_id, "translating")
 
-    # Verify Ollama server
-    if not translator.check_ollama_status():
+    # Verify Ollama server if local engine is chosen
+    if translation_engine == "ollama" and not translator.check_ollama_status():
         console.print("[bold red]Warning:[/] Ollama is not running on http://localhost:11434.")
-        console.print("Please launch Ollama and pull your model: [bold green]ollama pull ministral-3b[/]")
+        console.print(f"Please launch Ollama or pull your model: [bold green]ollama pull {model_llm}[/]")
         sys.exit(1)
 
     with Progress(
@@ -182,7 +224,15 @@ def run_pipeline(
             snippet = (text[:35] + "...") if len(text) > 35 else text
             progress.update(task_mt, completed=idx + 1, description=f"Chunk {idx+1}/{total}: {snippet}")
 
-        chunks = translator.process_translation_stage(chunks, job_id, model_name=model_llm, progress_callback=mt_callback)
+        chunks = translator.process_translation_stage(
+            chunks, 
+            job_id, 
+            model_name=model_llm, 
+            engine=translation_engine, 
+            api_key=effective_api_key, 
+            batch_size=translation_batch_size,
+            progress_callback=mt_callback
+        )
 
     # Export English translations and subtitles
     en_txt_path = job_output_dir / "translation_en.txt"
@@ -206,17 +256,23 @@ def run_pipeline(
         TimeRemainingColumn(),
         console=console
     ) as progress:
-        task_tts = progress.add_task("Voice cloning chunks", total=len(chunks))
+        task_tts = progress.add_task("Cloning audio chunks", total=len(chunks))
 
-        def tts_callback(idx, total, path):
-            progress.update(task_tts, completed=idx + 1, description=f"Synthesized {idx+1}/{total}")
+        def tts_callback(idx, total, *args):
+            progress.update(task_tts, completed=idx + 1, description=f"Dubbing Chunk {idx+1}/{total}")
 
-        chunks = tts_cloner.process_tts_stage(chunks, str(speaker_ref_wav), job_id, progress_callback=tts_callback)
+        chunks = tts_cloner.process_tts_stage(
+            chunks=chunks, 
+            reference_audio_path=str(speaker_ref_wav), 
+            job_id=job_id, 
+            output_dir=str(chunks_dir), 
+            progress_callback=tts_callback
+        )
 
     # =========================================================================
-    # Step 4: Audio Stitching & Synchronization
+    # Step 4: Stitching & Final Audio Alignment
     # =========================================================================
-    console.print(f"\n[bold yellow]Step 4: Stitching audio to match original video timeline...[/]")
+    console.print("\n[bold yellow]Step 4: Stitching dubbed audio into complete timeline...[/]")
     db.update_job_status(job_id, "stitching")
 
     dubbed_wav_path = job_output_dir / "dubbed_english.wav"
@@ -228,17 +284,25 @@ def run_pipeline(
             target_sample_rate=config.sample_rate_tts
         )
 
+    dubbed_video_path = None
+    if input_path.suffix.lower() in [".mp4", ".mkv", ".mov", ".avi", ".webm"]:
+        dubbed_video_path = job_output_dir / f"dubbed_{input_path.stem}.mp4"
+        with console.status("[cyan]Muxing video with cloned English audio..."):
+            audio_utils.mux_video_audio(str(input_path), str(dubbed_wav_path), str(dubbed_video_path))
+
     db.update_job_status(job_id, "completed")
     elapsed = time.time() - start_time
 
     # =========================================================================
     # Step 5: Summary Table
     # =========================================================================
-    table = Table(title="🎉 Job Complete - Results Summary", border_style="green")
+    table = Table(title="Job Complete - Results Summary", border_style="green")
     table.add_column("Artifact", style="cyan")
     table.add_column("Path", style="magenta")
     table.add_column("Details", style="green")
 
+    if dubbed_video_path and dubbed_video_path.exists():
+        table.add_row("Dubbed English Video", str(dubbed_video_path.name), "Synchronized MP4 video with dubbed audio")
     table.add_row("Dubbed English Audio", str(dubbed_wav_path.name), f"{total_duration:.1f}s synchronized WAV")
     table.add_row("Arabic Transcript", str(ar_txt_path.name), "Full text (.txt)")
     table.add_row("Arabic Subtitles", str(ar_srt_path.name), "VLC timestamped (.srt)")
@@ -250,13 +314,18 @@ def run_pipeline(
     console.print(f"[bold green]Success![/] Total elapsed time: [bold yellow]{elapsed:.1f} seconds[/]")
     console.print(f"Output files stored in: [bold cyan]{job_output_dir}[/]\n")
 
+
 def main():
     parser = argparse.ArgumentParser(description="Arabic-to-English Speech-to-Speech Translation & Voice Cloning Studio")
     parser.add_argument("--input", "-i", type=str, required=True, help="Path to input Arabic video or audio file")
     parser.add_argument("--output-dir", "-o", type=str, default=None, help="Custom output directory")
     parser.add_argument("--job-id", type=str, default=None, help="Custom job ID")
-    parser.add_argument("--stt-backend", type=str, default=config.stt_backend, choices=["audar", "whisper"], help="STT backend engine")
-    parser.add_argument("--model-llm", type=str, default=config.translation_model, help="Ollama model for translation")
+    parser.add_argument("--stt-backend", type=str, default=config.stt_backend, choices=["gemini", "audar", "whisper"], help="STT backend engine (default: gemini)")
+    parser.add_argument("--translation-engine", type=str, default=config.translation_engine, choices=["gemini_api", "ollama"], help="Translation engine ('gemini_api' or 'ollama')")
+    parser.add_argument("--model-llm", type=str, default=config.translation_model, help="Translation model (default: gemma-4-31b-it for gemini_api)")
+    parser.add_argument("--gemini-api-key", type=str, default=None, help="Google Gemini API key")
+    parser.add_argument("--stt-batch-size", type=int, default=config.stt_batch_size, help=f"Chunks per STT request (default: {config.stt_batch_size})")
+    parser.add_argument("--translation-batch-size", type=int, default=config.translation_batch_size, help=f"Chunks per translation request (default: {config.translation_batch_size})")
     parser.add_argument("--resume", action="store_true", help="Resume an existing interrupted job from SQLite")
     args = parser.parse_args()
 
@@ -265,9 +334,14 @@ def main():
         job_id=args.job_id,
         output_dir=args.output_dir,
         stt_backend=args.stt_backend,
+        translation_engine=args.translation_engine,
         model_llm=args.model_llm,
+        gemini_api_key=args.gemini_api_key,
+        stt_batch_size=args.stt_batch_size,
+        translation_batch_size=args.translation_batch_size,
         resume=args.resume
     )
+
 
 if __name__ == "__main__":
     main()

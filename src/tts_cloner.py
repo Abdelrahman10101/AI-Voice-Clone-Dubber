@@ -5,7 +5,7 @@ import asyncio
 import soundfile as sf
 import numpy as np
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from src.config import config, OPENVOICE_MODELS_DIR
 from src.db import update_chunk_tts
 
@@ -128,6 +128,7 @@ def process_tts_stage(
     chunks: List[Dict[str, Any]], 
     reference_audio_path: str,
     job_id: str,
+    output_dir: Optional[str] = None,
     progress_callback=None
 ) -> List[Dict[str, Any]]:
     cloner = AudioCloner()
@@ -146,8 +147,8 @@ def process_tts_stage(
 
             english_text = chunk.get("english_text", "").strip()
             chunk_idx = chunk["chunk_index"]
-            output_dir = os.path.dirname(chunk["chunk_audio_path"])
-            cloned_audio_path = os.path.join(output_dir, f"cloned_{chunk_idx:04d}.wav")
+            chunk_dir = output_dir if output_dir else os.path.dirname(chunk.get("chunk_audio_path", "."))
+            cloned_audio_path = os.path.join(chunk_dir, f"cloned_{chunk_idx:04d}.wav")
 
             cloner.synthesize_and_clone(english_text, cloned_audio_path)
 

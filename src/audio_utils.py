@@ -228,3 +228,29 @@ def export_txt(chunks: List[Dict[str, Any]], output_path: str, text_key: str = "
             if text:
                 f.write(f"{text}\n")
     return output_path
+
+def mux_video_audio(video_path: str, audio_path: str, output_path: str) -> str:
+    """Combines original video with newly dubbed audio into a synchronized MP4."""
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(video_path),
+        "-i", str(audio_path),
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-shortest",
+        str(output_path)
+    ]
+    result = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        encoding="utf-8",
+        errors="replace"
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"FFmpeg video-audio muxing failed: {result.stderr}")
+    return output_path
+
