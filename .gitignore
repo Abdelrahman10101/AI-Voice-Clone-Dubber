@@ -1,0 +1,89 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment variables & secrets
+.env
+.env.local
+*.env
+
+# Large model weights & checkpoints (fetched via download_models.py)
+models/*
+!models/.gitkeep
+models/**/.cache/
+*.gguf
+*.pth
+*.pt
+*.onnx
+*.safetensors
+.cache/
+
+# Runtime data, job database & temporary directories
+data/input/*
+!data/input/.gitkeep
+data/output/*
+!data/output/.gitkeep
+data/history.db
+*.db
+*.sqlite
+*.sqlite3
+
+# Scratch directory
+scratch/*
+!scratch/.gitkeep
+
+# Compiled binaries and DLLs
+bin/*
+!bin/.gitkeep
+*.exe
+*.dll
+
+# Unit test & coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editor & IDE specific files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+.project
+.pydevproject
+
+# Operating System files
+.DS_Store
+Thumbs.db
+desktop.ini
+*.log
